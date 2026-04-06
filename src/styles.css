@@ -12,6 +12,9 @@
   --accent-faint: #e7f1ea;
   --stage-name: #2e7e5e;
   --stage-meta: #6d7f72;
+  --source-chip-bg: #edf5ef;
+  --source-chip-border: #cfddd1;
+  --source-chip-text: #2f6d51;
   --bubble-bg: #2f8a66;
   --bubble-text: #f7fffb;
   --module-text: #2d7c5d;
@@ -117,6 +120,31 @@ body {
 .stage-row {
   border-top: 1px solid var(--stage-divider);
   padding: 18px 0 6px;
+  width: 100%;
+}
+
+.stage-row-header {
+  width: 100%;
+}
+
+.stage-source-row {
+  margin-top: 10px;
+}
+
+.stage-source-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--source-chip-border);
+  border-radius: 999px;
+  background: var(--source-chip-bg);
+  color: var(--source-chip-text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.01em;
 }
 
 .mantine-Accordion-item {

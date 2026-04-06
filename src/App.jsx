@@ -95,6 +95,101 @@ function extractReasoning(packet) {
   return "";
 }
 
+const SOURCE_TOKEN_ALIASES = {
+  ai: "AI",
+  api: "API",
+  db: "DB",
+  kb: "KB",
+  llm: "LLM",
+  mcp: "MCP",
+  rag: "RAG",
+  sse: "SSE",
+  ui: "UI",
+  ux: "UX",
+  ws: "WS",
+};
+
+const SOURCE_SUFFIX_ALIASES = ["ai", "api", "db", "kb", "ui"];
+
+function formatSourceToken(token) {
+  if (!token) return "";
+
+  const trimmed = token.trim();
+  if (!trimmed) return "";
+
+  const normalized = trimmed.toLowerCase();
+  if (SOURCE_TOKEN_ALIASES[normalized]) {
+    return SOURCE_TOKEN_ALIASES[normalized];
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/[A-Z]/.test(trimmed.slice(1))) {
+    return trimmed;
+  }
+
+  for (const suffix of SOURCE_SUFFIX_ALIASES) {
+    if (normalized.endsWith(suffix) && normalized.length > suffix.length) {
+      const prefix = normalized.slice(0, -suffix.length);
+      return `${prefix.charAt(0).toUpperCase()}${prefix.slice(1)}${SOURCE_TOKEN_ALIASES[suffix]}`;
+    }
+  }
+
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}
+
+function normalizeSourceLabel(value) {
+  if (typeof value !== "string") return null;
+  const label = value.trim().replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+
+  if (!label) return null;
+
+  const parts = label
+    .split(/[\s_./:-]+/)
+    .map((part) => formatSourceToken(part))
+    .filter(Boolean);
+
+  if (parts.length === 0) return null;
+
+  return parts.join(" ");
+}
+
+function extractPacketSources(packet) {
+  const sources = [];
+  const seen = new Set();
+
+  const addSource = (value) => {
+    const label = normalizeSourceLabel(value);
+    const key = label?.toLowerCase();
+
+    if (!label || !key || seen.has(key)) return;
+    seen.add(key);
+    sources.push(label);
+  };
+
+  if (packet?.context) {
+    addSource(packet.context.source);
+
+    if (Array.isArray(packet.context.chunks)) {
+      for (const chunk of packet.context.chunks) {
+        addSource(chunk?.source);
+      }
+    }
+
+    if (sources.length === 0) {
+      addSource(packet.context.agent);
+    }
+  }
+
+  if (sources.length === 0 && stageFromPacket(packet) === "retrieval") {
+    addSource(packet?.step?.module);
+  }
+
+  return sources;
+}
+
 async function streamSse({ endpoint, payload, onEvent, signal }) {
   const response = await fetch(endpoint, {
     method: "POST",
@@ -191,10 +286,17 @@ export default function App() {
           id: `${item.id}-block`,
           stage: item.stage,
           items: [],
+          sources: [],
         };
         blocks.push(current);
       }
       current.items.push(item);
+
+      for (const source of item.sources || []) {
+        if (!current.sources.includes(source)) {
+          current.sources.push(source);
+        }
+      }
     }
     return blocks;
   }, [traceItems]);
@@ -261,7 +363,9 @@ export default function App() {
             return true;
           }
 
-          const moduleName = data?.step?.module || "system";
+          const sources = extractPacketSources(data);
+          const moduleName =
+            data?.step?.module || data?.context?.agent || data?.context?.source || "system";
           const title =
             data?.step?.title || (data?.context ? "Context" : "Packet");
           const output = extractOutputMarkdown(data);
@@ -286,6 +390,7 @@ export default function App() {
               stage,
               module: moduleName,
               title,
+              sources,
               questionText,
               output,
               reasoning,
@@ -384,14 +489,26 @@ export default function App() {
                 {stageBlocks.map((block, idx) => (
                   <Accordion.Item value={block.id} key={block.id}>
                     <Accordion.Control>
-                      <Group gap="xs" className="stage-row">
-                        <Text fw={700} tt="capitalize" className="stage-name">
-                          {block.stage}
-                        </Text>
-                        <Text c="dimmed" size="sm" className="stage-meta">
-                          block {idx + 1} ({block.items.length} events)
-                        </Text>
-                      </Group>
+                      <Box className="stage-row">
+                        <Group gap="xs" className="stage-row-header">
+                          <Text fw={700} tt="capitalize" className="stage-name">
+                            {block.stage}
+                          </Text>
+                          <Text c="dimmed" size="sm" className="stage-meta">
+                            block {idx + 1} ({block.items.length} events)
+                          </Text>
+                        </Group>
+
+                        {block.stage === "retrieval" && block.sources.length > 0 ? (
+                          <Group gap="xs" className="stage-source-row">
+                            {block.sources.map((source) => (
+                              <Box key={source} className="stage-source-chip">
+                                {source}
+                              </Box>
+                            ))}
+                          </Group>
+                        ) : null}
+                      </Box>
                     </Accordion.Control>
                     <Accordion.Panel>
                       <Stack gap="sm">
