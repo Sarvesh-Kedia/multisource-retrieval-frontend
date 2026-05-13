@@ -3,11 +3,11 @@ import ReactMarkdown from "react-markdown";
 import {
   Accordion,
   AppShell,
-  Badge,
   Box,
   Button,
   Group,
   ScrollArea,
+  SegmentedControl,
   Stack,
   Text,
   Textarea,
@@ -16,8 +16,15 @@ import {
 
 const BACKEND_URL = "http://127.0.0.1:3001";
 const DEFAULT_SESSION_ID = "77e3e4168b314452b68ac57c6859bb4b";
-const SAMPLE_QUESTION =
-  "What are the major equity investment trends in the US and globally in early 2025, what are the top 5 holdings by weight in each of our portfolios as of 31 Jan 2025, and how do our current exposures align or diverge from those trends?";
+
+const SAMPLE_QUERIES = [
+  "What are Eastspring's top performing funds this year?",
+  "Which client portfolios have the largest allocation to Asian equities?",
+  "What is Eastspring's current view on global interest rates?",
+  "What are the top 5 holdings across all client portfolios?",
+  "Summarise the key investment themes from Eastspring's latest annual report.",
+  "What are the major equity investment trends in the US and globally in early 2025, what are the top 5 holdings by weight in each of our portfolios as of 31 Jan 2025, and how do our current exposures align or diverge from those trends?",
+];
 
 const MODULE_TO_STAGE = {
   rephrase: "preprocessing",
@@ -29,6 +36,10 @@ const MODULE_TO_STAGE = {
 };
 
 function stageFromPacket(packet) {
+  const agentPath = packet?.step?.agent_path || "";
+  if (agentPath.startsWith("/preprocess/")) return "preprocessing";
+  if (agentPath.startsWith("/generation/")) return "generation";
+  if (agentPath.startsWith("/context/")) return "retrieval";
   if (packet?.step?.module) return MODULE_TO_STAGE[packet.step.module] || "retrieval";
   if (packet?.answer || packet?.possible_answer) return "generation";
   if (packet?.feedback || packet?.oauth) return "evaluation";
@@ -190,6 +201,82 @@ function extractPacketSources(packet) {
   return sources;
 }
 
+function formatRephraseOutput(value) {
+  if (!value) return value;
+  const match = value.match(/^(\d+)\s+questions?\.\s*\nQuestions?:\s*(.+)$/is);
+  if (!match) return value;
+  const raw = match[2].trim();
+  const questions = raw.split(/\?,\s+/).map((q, i, arr) =>
+    i < arr.length - 1 ? q.trim() + "?" : q.trim()
+  );
+  return questions.map((q, i) => `${i + 1}. ${q}`).join("\n");
+}
+
+function formatMcpOutput(step) {
+  const value = step?.value || "";
+  const toolMatch = value.match(/^Used tool:\s*(\S+)\s+with arguments:\s*/);
+  if (!toolMatch) return value;
+  const tool = toolMatch[1];
+  const argsStr = value.slice(toolMatch[0].length);
+  const sqlMatch = argsStr.match(/['"](?:query|sql)['"]\s*:\s*['"]?([\s\S]+?)['"]?\s*[,}]/);
+  if (sqlMatch) {
+    return `**\`${tool}\`**\n\`\`\`sql\n${sqlMatch[1].trim()}\n\`\`\``;
+  }
+  return `**\`${tool}\`**\n\`\`\`\n${argsStr}\n\`\`\``;
+}
+
+function parseMcpError(errorStr) {
+  if (!errorStr) return null;
+  try {
+    const obj = JSON.parse(errorStr);
+    return obj?.error?.message || obj?.message || errorStr;
+  } catch {
+    return errorStr;
+  }
+}
+
+function extractChunkUrls(packet) {
+  if (!packet?.context?.chunks) return [];
+  const urls = [];
+  const seen = new Set();
+  for (const chunk of packet.context.chunks) {
+    if (Array.isArray(chunk.url)) {
+      for (const u of chunk.url) {
+        if (typeof u === "string" && u && !seen.has(u)) {
+          seen.add(u);
+          urls.push(u);
+        }
+      }
+    }
+    if (typeof chunk.origin_url === "string" && chunk.origin_url && !seen.has(chunk.origin_url)) {
+      seen.add(chunk.origin_url);
+      urls.push(chunk.origin_url);
+    }
+  }
+  return urls;
+}
+
+function extractChunkDocs(packet) {
+  if (!packet?.context?.chunks) return [];
+  const docs = [];
+  const seen = new Set();
+  const isKBContext = packet?.context?.agent === "advanced_ask";
+  for (const chunk of packet.context.chunks) {
+    const isKBChunk = chunk?.origin_agent === "advanced_ask" || isKBContext;
+    if (isKBChunk && chunk?.title) {
+      const clean = chunk.title
+        .replace(/\.[a-z]+$/i, "")
+        .replace(/[-_]+/g, " ")
+        .trim();
+      if (clean && !seen.has(clean.toLowerCase())) {
+        seen.add(clean.toLowerCase());
+        docs.push(clean);
+      }
+    }
+  }
+  return docs;
+}
+
 async function streamSse({ endpoint, payload, onEvent, signal }) {
   const response = await fetch(endpoint, {
     method: "POST",
@@ -269,7 +356,10 @@ const composerTextareaStyles = {
 };
 
 export default function App() {
-  const [question, setQuestion] = useState(SAMPLE_QUESTION);
+  const [question, setQuestion] = useState("");
+  const [submittedQuestion, setSubmittedQuestion] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [streamMode, setStreamMode] = useState("post");
   const [streamStatus, setStreamStatus] = useState("idle");
   const [activeStage, setActiveStage] = useState("none");
   const [error, setError] = useState("");
@@ -301,18 +391,21 @@ export default function App() {
     return blocks;
   }, [traceItems]);
 
-  const defaultOpen = useMemo(() => stageBlocks.map((b) => b.id), [stageBlocks]);
-
   const runStream = async () => {
     if (!question.trim()) return;
 
     setStreamStatus("running");
+    setSubmittedQuestion(question);
     setError("");
     setTraceItems([]);
     setModuleSubqueryHint({});
     setActiveStage("none");
+    setShowSuggestions(false);
 
-    const endpoint = `${BACKEND_URL}/api/interactions/stream`;
+    const endpoint =
+      streamMode === "post"
+        ? `${BACKEND_URL}/api/interactions/stream-post`
+        : `${BACKEND_URL}/api/interactions/stream`;
     const payload = {
       sessionId: DEFAULT_SESSION_ID,
       interactionRequest: {
@@ -334,23 +427,36 @@ export default function App() {
           if (event === "error") {
             setError(typeof data === "string" ? data : JSON.stringify(data));
             setStreamStatus("failed");
-            setActiveStage("none");
+            setActiveStage("failed");
             return false;
           }
 
           if (event === "complete") {
             setStreamStatus("done");
-            setActiveStage("none");
+            setActiveStage("completed");
             return false;
           }
 
-          if (event !== "packet" || !isUsefulPacket(data)) {
+          if (event !== "packet") {
+            return true;
+          }
+
+          if (data?.operation === 4) {
+            const detail = data?.exception?.detail;
+            const errAnswer = typeof data?.answer === "string" ? data.answer : null;
+            setError(detail || errAnswer || "Pipeline error");
+            setStreamStatus("failed");
+            setActiveStage("failed");
+            return false;
+          }
+
+          if (!isUsefulPacket(data)) {
             return true;
           }
 
           if (typeof data?.answer === "string" && data.answer.trim()) {
             setStreamStatus("done");
-            setActiveStage("none");
+            setActiveStage("completed");
             return false;
           }
 
@@ -359,22 +465,28 @@ export default function App() {
           }
 
           const stage = stageFromPacket(data);
-          if (data?.possible_answer?.answer) {
-            return true;
-          }
 
           const sources = extractPacketSources(data);
+          const urls = extractChunkUrls(data);
+          const docs = extractChunkDocs(data);
           const moduleName =
             data?.step?.module || data?.context?.agent || data?.context?.source || "system";
           const title =
             data?.step?.title || (data?.context ? "Context" : "Packet");
-          const output = extractOutputMarkdown(data);
+
+          let output = extractOutputMarkdown(data);
+          if (moduleName === "rephrase") output = formatRephraseOutput(output);
+          else if (moduleName === "mcp") output = formatMcpOutput(data.step);
+
           const reasoning = extractReasoning(data);
           const subqueryHint = extractSubqueryHint(data);
           const contextQuestion = data?.context?.question || null;
           const questionText =
             subqueryHint || moduleSubqueryHint[moduleName] || contextQuestion || question;
           const timeMs = data?.step?.timeit ? Math.round(Number(data.step.timeit) * 1000) : null;
+
+          const rawError = data?.step?.error || data?.exception?.detail || null;
+          const error = moduleName === "mcp" ? parseMcpError(rawError) : rawError;
 
           if (subqueryHint && moduleName) {
             setModuleSubqueryHint((prev) => ({ ...prev, [moduleName]: subqueryHint }));
@@ -399,7 +511,9 @@ export default function App() {
                 in: data?.step?.input_nuclia_tokens ?? null,
                 out: data?.step?.output_nuclia_tokens ?? null,
               },
-              error: data?.step?.error || data?.exception?.detail || null,
+              error,
+              urls,
+              docs,
             },
           ]);
 
@@ -408,15 +522,16 @@ export default function App() {
       });
 
       setStreamStatus((prev) => (prev === "running" ? "done" : prev));
+      setActiveStage((prev) => (prev === "none" ? "completed" : prev));
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         setStreamStatus("stopped");
-        setActiveStage("none");
+        setActiveStage("stopped");
         return;
       }
       setError(err instanceof Error ? err.message : String(err));
       setStreamStatus("failed");
-      setActiveStage("none");
+      setActiveStage("failed");
     } finally {
       abortRef.current = null;
     }
@@ -444,29 +559,21 @@ export default function App() {
       className="notion-shell"
     >
       <AppShell.Header className="sticky-header">
-        <Group justify="space-between" px="md" py="sm" h="100%">
+        <Group px="md" py="sm" h="100%">
           <Box>
             <Title order={3} className="trace-title">
-              RAO Trace Chat
+              Retrieval Agent Orchestrator Demo
             </Title>
-            <Text size="sm" className="active-stage-label">
-              Active stage: {activeStage}
-            </Text>
+            {activeStage !== "none" && (
+              <Text
+                size="sm"
+                className="active-stage-label"
+                c={activeStage === "failed" ? "red" : activeStage === "stopped" ? "orange" : undefined}
+              >
+                {activeStage.charAt(0).toUpperCase() + activeStage.slice(1)}
+              </Text>
+            )}
           </Box>
-          <Badge
-            variant="light"
-            color={
-              streamStatus === "failed"
-                ? "red"
-                : streamStatus === "done"
-                  ? "green"
-                  : streamStatus === "stopped"
-                    ? "yellow"
-                    : "blue"
-            }
-          >
-            {streamStatus}
-          </Badge>
         </Group>
       </AppShell.Header>
 
@@ -478,15 +585,20 @@ export default function App() {
             </Text>
           ) : null}
 
-          {traceItems.length === 0 ? (
-            <Text c="dimmed">Submit a prompt to begin streaming trace events.</Text>
-          ) : (
+          {submittedQuestion && (
             <ScrollArea h="calc(100vh - 320px)" offsetScrollbars>
               <Box className="user-bubble-wrap">
-                <Box className="user-bubble">{question}</Box>
+                <Box className="user-bubble">{submittedQuestion}</Box>
               </Box>
-              <Accordion multiple defaultValue={defaultOpen} variant="unstyled">
-                {stageBlocks.map((block, idx) => (
+              {streamStatus === "running" && traceItems.length === 0 && (
+                <Box className="thinking-row">
+                  <span className="thinking-dot" />
+                  <span className="thinking-dot" />
+                  <span className="thinking-dot" />
+                </Box>
+              )}
+              <Accordion multiple variant="unstyled">
+                {stageBlocks.map((block) => (
                   <Accordion.Item value={block.id} key={block.id}>
                     <Accordion.Control>
                       <Box className="stage-row">
@@ -495,7 +607,7 @@ export default function App() {
                             {block.stage}
                           </Text>
                           <Text c="dimmed" size="sm" className="stage-meta">
-                            block {idx + 1} ({block.items.length} events)
+                            {block.items.length} {block.items.length === 1 ? "step" : "steps"}
                           </Text>
                         </Group>
 
@@ -531,12 +643,16 @@ export default function App() {
                                 </Group>
                               </summary>
 
-                              <Text fw={700} size="sm" mb={4} className="content-label">
-                                Question
-                              </Text>
-                              <Text size="sm" className="question-copy">
-                                {item.questionText}
-                              </Text>
+                              {item.questionText ? (
+                                <>
+                                  <Text fw={700} size="sm" mb={4} className="content-label">
+                                    Sub-query
+                                  </Text>
+                                  <Text size="sm" className="question-copy">
+                                    {item.questionText}
+                                  </Text>
+                                </>
+                              ) : null}
 
                               {item.output ? (
                                 <>
@@ -547,6 +663,43 @@ export default function App() {
                                 </>
                               ) : null}
 
+                              {item.urls?.length > 0 ? (
+                                <Box mt="sm">
+                                  <Text fw={700} size="xs" mb={4} className="content-label">
+                                    Web sources
+                                  </Text>
+                                  <Stack gap={2}>
+                                    {item.urls.slice(0, 5).map((url, i) => {
+                                      let label = url;
+                                      try { label = new URL(url).hostname.replace(/^www\./, ""); } catch {}
+                                      return (
+                                        <Text key={i} size="xs">
+                                          <a href={url} target="_blank" rel="noopener noreferrer" className="source-link">
+                                            {label}
+                                          </a>
+                                        </Text>
+                                      );
+                                    })}
+                                    {item.urls.length > 5 ? (
+                                      <Text size="xs" c="dimmed">+{item.urls.length - 5} more</Text>
+                                    ) : null}
+                                  </Stack>
+                                </Box>
+                              ) : null}
+
+                              {item.docs?.length > 0 ? (
+                                <Box mt="sm">
+                                  <Text fw={700} size="xs" mb={4} className="content-label">
+                                    Documents
+                                  </Text>
+                                  <Group gap="xs" wrap="wrap">
+                                    {item.docs.map((doc, i) => (
+                                      <Box key={i} className="doc-chip" title={doc}>{doc}</Box>
+                                    ))}
+                                  </Group>
+                                </Box>
+                              ) : null}
+
                               {item.reasoning ? (
                                 <Text size="sm" mt="sm" className="reasoning-copy">
                                   {item.reasoning}
@@ -555,25 +708,23 @@ export default function App() {
 
                               <Group gap="xs" mt="sm">
                                 {item.timeMs ? (
-                                  <Badge variant="light" color="gray">
-                                    {item.timeMs} ms
-                                  </Badge>
+                                  <Box className="meta-chip">
+                                    {item.timeMs >= 1000
+                                      ? `${(item.timeMs / 1000).toFixed(1)} s`
+                                      : `${item.timeMs} ms`}
+                                  </Box>
                                 ) : null}
                                 {item.tokens.in !== null ? (
-                                  <Badge variant="light" color="gray">
-                                    in: {item.tokens.in}
-                                  </Badge>
+                                  <Box className="meta-chip">in: {item.tokens.in}</Box>
                                 ) : null}
                                 {item.tokens.out !== null ? (
-                                  <Badge variant="light" color="gray">
-                                    out: {item.tokens.out}
-                                  </Badge>
+                                  <Box className="meta-chip">out: {item.tokens.out}</Box>
                                 ) : null}
                               </Group>
 
                               {item.error ? (
                                 <Text c="red" size="sm" mt="sm" fw={600}>
-                                  Module error: {item.error}
+                                  {item.error}
                                 </Text>
                               ) : null}
                             </details>
@@ -591,18 +742,57 @@ export default function App() {
 
       <AppShell.Footer className="sticky-composer">
         <Box p="md" className="composer-wrap">
-          <Group align="flex-end" wrap="nowrap" gap="sm">
-            <Box style={{ flex: 1 }}>
-              <Textarea
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                autosize
-                minRows={2}
-                maxRows={5}
-                placeholder="Ask a question..."
-                styles={composerTextareaStyles}
-              />
+          {showSuggestions && (
+            <Box className="suggestions-panel">
+              {SAMPLE_QUERIES.map((q, i) => (
+                <Box
+                  key={i}
+                  className="suggestion-item"
+                  onClick={() => {
+                    setQuestion(q);
+                    setShowSuggestions(false);
+                  }}
+                >
+                  {q}
+                </Box>
+              ))}
             </Box>
+          )}
+          <Textarea
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Tab") {
+                e.preventDefault();
+                setShowSuggestions((prev) => !prev);
+                return;
+              }
+              if (e.key === "Escape" && showSuggestions) {
+                setShowSuggestions(false);
+                return;
+              }
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") handlePrimaryAction();
+            }}
+            autosize
+            minRows={2}
+            maxRows={2}
+            placeholder="Ask a question… (Tab for examples)"
+            styles={composerTextareaStyles}
+          />
+          <Group justify="space-between" mt="xs" align="center">
+            <Group gap="xs" align="center">
+              <Text size="xs" c="dimmed">Transport:</Text>
+              <SegmentedControl
+                size="xs"
+                value={streamMode}
+                onChange={setStreamMode}
+                disabled={streamStatus === "running"}
+                data={[
+                  { label: "HTTP POST", value: "post" },
+                  { label: "WebSocket", value: "websocket" },
+                ]}
+              />
+            </Group>
             <Button
               onClick={handlePrimaryAction}
               className="primary-action-btn"
