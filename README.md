@@ -34,11 +34,11 @@ Backend listens on `http://127.0.0.1:3001`. Frontend expects the backend at that
 
 | Variable | Purpose |
 |---|---|
-| `RAO_BASE_URL` | Base HTTPS URL of the RAO API |
-| `RAO_AGENT_ID` | Agent UUID |
+| `RAO_BASE_URL` | `https://<region>.dp.progress.cloud`; the region is shown in the agent's Settings section |
+| `RAO_AGENT_ID` | Agent UUID, from the agent's Settings section |
 | `RAO_API_KEY` | Long-lived JWT (RS256) — used as Bearer token for all REST calls and HTTP POST streaming |
 | `RAO_ACCOUNT_ID` | Account UUID (used in ephemeral token path) |
-| `RAO_KB_ID` | Knowledge base UUID (defaults to `RAO_AGENT_ID` if unset) |
+| `RAO_KB_ID` | Knowledge box UUID; for a RAO agent this is the same value as `RAO_AGENT_ID` (defaults to it if unset) |
 | `RAO_WORKFLOW_ID` | Workflow name sent as `?workflow_id=` (defaults to `"default"`) |
 
 Path templates can be overridden with env vars (see `buildConfig()` in `server/src/server.js`) but the defaults match the current RAO API layout. Both interaction templates contain `{session_id}`, which is filled with the literal `ephemeral` or a real session id depending on the request's `sessionMode` (see §4).
