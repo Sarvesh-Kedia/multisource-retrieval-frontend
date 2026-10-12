@@ -418,3 +418,112 @@ body {
 .composer-wrap textarea:focus {
   border-color: var(--accent) !important;
 }
+
+/* ---- Session / history blueprint additions ---- */
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 46vw;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--source-chip-bg);
+  border: 1px solid var(--source-chip-border);
+  color: var(--source-chip-text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-turn {
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px dashed var(--stage-divider);
+}
+
+.turn-answer {
+  margin: -6px 0 6px;
+}
+
+.turn-answer-summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--stage-meta);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 4px 0 8px;
+}
+
+.turn-answer-summary::-webkit-details-marker {
+  display: none;
+}
+
+.turn-answer-summary::before {
+  content: "▸ ";
+}
+
+.turn-answer[open] .turn-answer-summary::before {
+  content: "▾ ";
+}
+
+.answer-block {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--source-chip-border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.answer-block .md-block {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.payload-block {
+  margin-top: 20px;
+  font-size: 0.8rem;
+  color: var(--stage-meta);
+}
+
+.payload-summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--stage-meta);
+  word-break: break-all;
+}
+
+.payload-block pre {
+  margin: 8px 0 0;
+  padding: 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 10px;
+  overflow: auto;
+  color: var(--event-text);
+  max-height: 320px;
+}
+
+.history-switch .mantine-Switch-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  padding-left: 6px;
+}
+
+.secondary-action-btn {
+  background: var(--button-bg);
+  border: 1px solid var(--button-border);
+  color: var(--button-text);
+}
+
+.scenario-row {
+  padding-bottom: 2px;
+  border-bottom: 1px dashed var(--stage-divider);
+}
+
+.scenario-summary {
+  color: var(--source-chip-text);
+  font-weight: 600;
+}

@@ -41,7 +41,9 @@ Backend listens on `http://127.0.0.1:3001`. Frontend expects the backend at that
 | `RAO_KB_ID` | Knowledge base UUID (defaults to `RAO_AGENT_ID` if unset) |
 | `RAO_WORKFLOW_ID` | Workflow name sent as `?workflow_id=` (defaults to `"default"`) |
 
-Path templates can be overridden with env vars (see `buildConfig()` in `server/src/server.js`) but the defaults match the current RAO API layout.
+Path templates can be overridden with env vars (see `buildConfig()` in `server/src/server.js`) but the defaults match the current RAO API layout. Both interaction templates contain `{session_id}`, which is filled with the literal `ephemeral` or a real session id depending on the request's `sessionMode` (see §4).
+
+`server/.env` is not tracked in git; copy `server/.env.example` and fill it in.
 
 **Important:** Never use credentials from sample curl snippets. Always use only the values in `server/.env`.
 
@@ -60,15 +62,18 @@ Node.js Server  (server/src/server.js)
     │  Relay: converts upstream stream → SSE  (text/event-stream)
     │  Browser always receives SSE regardless of upstream transport
     │
+    │  0. resolveSession(): {session_id} = "ephemeral"            (sessionMode "ephemeral")
+    │                        {session_id} = given or created id   (sessionMode "persistent")
+    │
     ├── WebSocket transport
-    │     1. POST /api/v1/account/{account_id}/kb/{kb_id}/ephemeral_tokens
+    │     1. POST /api/v1/account/{account_id}/kb/{kb_id}/ephemeral_tokens  { agent_session: {session_id} }
     │        → get short-lived eph-token (NOT a JWT, not usable in Authorization header)
-    │     2. Open WebSocket to /api/v1/agent/{agent_id}/session/ephemeral/ws?eph-token=...
+    │     2. Open WebSocket to /api/v1/agent/{agent_id}/session/{session_id}/ws?eph-token=...
     │     3. Send interactionRequest as JSON text frame
     │     4. Forward each message frame to browser as SSE "packet" event
     │
     └── HTTP POST transport
-          1. POST /api/v1/agent/{agent_id}/session/ephemeral
+          1. POST /api/v1/agent/{agent_id}/session/{session_id}
              Authorization: Bearer {RAO_API_KEY}
           2. Response body is a stream of concatenated JSON objects (no delimiter)
           3. Server parses with extractJsonObjects() (brace-depth counter)
@@ -79,7 +84,7 @@ Node.js Server  (server/src/server.js)
 
 | Event | When | Data shape |
 |---|---|---|
-| `ready` | Stream opened | `{ streamId, sessionId }` |
+| `ready` | Stream opened | `{ streamId, sessionId, sessionMode, sessionCreated, transport, upstream }` — in persistent mode the UI stores `sessionId` from here |
 | `socket_open` | Upstream connected | `{ streamId, sessionId }` |
 | `request_sent` | Question dispatched upstream | `{ streamId }` |
 | `packet` | Every RAO API message | The RAO packet object (see §5) |
@@ -99,6 +104,21 @@ Node.js Server  (server/src/server.js)
 | Error signal | operation 4 packet | operation 4 packet |
 
 **Default transport in the UI:** HTTP POST (left option in SegmentedControl).
+
+### 4.1 Session mode and chat history
+
+Independent of transport, each request carries a `sessionMode`:
+
+| Mode | Upstream `{session_id}` | Who stores history | What the UI sends per turn |
+|---|---|---|---|
+| `ephemeral` (default) | literal `ephemeral` | nobody | question + full transcript as `chat_history` when the **Persist history** toggle is on |
+| `persistent` | real session id (created on first turn, reported on `ready`) | RAO, per session | question only; `chat_history` omitted |
+
+`chat_history` is `[{ question, answer }]`, oldest first. Sending it overrides RAO's stored history for that request only; omitting it uses stored history; `[]` clears context. Only agents configured for history (rephrase `history: true`, summarize `conversational: true`, smart) use it.
+
+The footer **Scenario** picker (1–6) is a preset for these three controls, and the header chip always names the current scenario. The UI builds the body in `buildInteractionPayload()` (exported from `App.jsx`). Completed turns live in the `history` state; the turn in progress is committed to `history` when the *next* question starts, so it renders once with its trace. The answer text is captured from the first packet with a non-empty string `answer`.
+
+See [BLUEPRINT.md in the server repo](../server/BLUEPRINT.md) for the six-scenario matrix, curl examples per scenario and the numbered standalone scripts in `server/examples/`.
 
 ---
 
@@ -334,7 +354,7 @@ Run a curl command against the HTTP POST endpoint and save the output:
 curl -s -N -X POST http://127.0.0.1:3001/api/interactions/stream-post \
   -H "Content-Type: application/json" \
   -d '{
-    "sessionId": "77e3e4168b314452b68ac57c6859bb4b",
+    "sessionMode": "ephemeral",
     "interactionRequest": {
       "question": "YOUR QUESTION HERE",
       "operation": 0,
@@ -343,7 +363,7 @@ curl -s -N -X POST http://127.0.0.1:3001/api/interactions/stream-post \
   }' > artifacts/response_<label>.txt
 ```
 
-The session ID `77e3e4168b314452b68ac57c6859bb4b` is a known working session. Artifacts go in `artifacts/` at the project root.
+Use `"sessionMode": "persistent"` plus `"sessionId": "<id>"` to capture a turn against a stored session. Artifacts go in `server/artifacts/`.
 
 To analyse a captured artifact:
 
@@ -404,7 +424,9 @@ Add rendering inside the event card JSX (~line 590). Pattern for a new section:
 
 | File | Purpose |
 |---|---|
-| `server/src/server.js` | Node.js HTTP server. All RAO API communication, SSE relay, both transport handlers |
+| `server/src/server.js` | Node.js HTTP server. All RAO API communication, session resolution, SSE relay, both transport handlers |
+| `server/examples/*.mjs` | Standalone scripts, one per scenario (1–6, matching the BLUEPRINT.md matrix), calling RAO directly |
+| `server/BLUEPRINT.md` | Blueprint: session modes, transports, history rules, decision guide |
 | `frontend/src/App.jsx` | Entire React application — state, streaming, packet parsing, rendering |
 | `frontend/src/styles.css` | All CSS. Uses CSS custom properties defined in `:root`. No CSS modules |
 | `server/.env` | Credentials and config (never commit) |
@@ -414,12 +436,15 @@ Add rendering inside the event card JSX (~line 590). Pattern for a new section:
 
 | Function | What it does |
 |---|---|
-| `streamInteraction()` | WebSocket transport handler |
+| `streamInteractionViaWebSocket()` | WebSocket transport handler |
 | `streamInteractionViaPost()` | HTTP POST transport handler |
+| `prepareInteraction(req, res)` | Reads the body, validates `sessionMode`, normalises `interactionRequest`, resolves the session |
+| `resolveSession()` | `ephemeral` → literal id; `persistent` → given id or a newly created session |
+| `normalizeInteractionRequest()` | Forces `operation`/`headers`, forwards `chat_history` only when it is an array |
+| `createSession()` / `buildSessionCreatePayload()` | Creates a session; fills the five required fields with defaults |
+| `createEphemeralToken(sessionId)` | Mints a WebSocket token bound to `"ephemeral"` or a real session id |
 | `extractJsonObjects(buffer)` | Parses concatenated JSON stream from HTTP POST body |
 | `detectCompletion(packet)` | Returns non-null when operation 3 or 4 detected → triggers `complete` SSE event |
-| `parseStreamRequest(req)` | Reads + normalises the incoming request body |
-| `resolveSessionId()` | Uses existing sessionId or creates a new session |
 | `buildConfig()` | Reads all env vars and path templates |
 
 ### `frontend/src/App.jsx` key functions
@@ -439,6 +464,10 @@ Add rendering inside the event card JSX (~line 590). Pattern for a new section:
 | `formatMcpOutput(step)` | Formats MCP tool calls as bold tool name + SQL code block |
 | `parseMcpError(errorStr)` | Parses MCP JSON error strings to human-readable message |
 | `streamSse()` | Reads the SSE stream from the backend and fires `onEvent` per event |
+| `buildInteractionPayload()` | Builds the relay request body from session mode, history toggle, transcript and session id |
+| `SCENARIOS` / `findScenario()` | The six presets from the BLUEPRINT.md matrix; maps the three controls to a scenario number and back |
+| `applyScenario(id)` | Sets transport, session mode and history toggle for one scenario |
+| `resetConversation()` | "New chat": clears transcript, session id, trace and answer |
 
 ---
 
@@ -460,22 +489,29 @@ Add rendering inside the event card JSX (~line 590). Pattern for a new section:
 ## 10. UI layout overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ Header (82px)                                       │
-│   Title + active stage label                        │
-├─────────────────────────────────────────────────────┤
-│ Main (scrollable)                                   │
-│   User bubble (right-aligned)                       │
-│   ▸ Preprocessing  (N steps) ── collapsed           │
-│   ▸ Retrieval      (N steps) ── collapsed           │
-│      source chips: MCP | Advanced Ask | Perplexity  │
-│   ▸ Generation     (N steps) ── collapsed           │
-├─────────────────────────────────────────────────────┤
-│ Footer (170px)                                      │
-│   [ Textarea, max 2 rows, scrollable beyond ]       │
-│   Transport: [HTTP POST] [WebSocket]   [Submit]     │
-│   (Tab key shows sample query picker)               │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Header (82px)                                                │
+│   Title + active stage label   [chip: Scenario N · mode/id]  │
+├──────────────────────────────────────────────────────────────┤
+│ Main (scrollable)                                            │
+│   Previous turns: user bubble + ▸ "Answer to turn N"         │
+│   Current turn:                                              │
+│     User bubble (right-aligned)                              │
+│     ▸ Preprocessing  (N steps) ── collapsed                  │
+│     ▸ Retrieval      (N steps) ── collapsed                  │
+│        source chips: MCP | Advanced Ask | Perplexity         │
+│     ▸ Generation     (N steps) ── collapsed                  │
+│     Answer block (final markdown answer)                     │
+│   ▸ Request payload sent to the relay → upstream URL         │
+├──────────────────────────────────────────────────────────────┤
+│ Footer (236px)                                               │
+│   [ Textarea, max 2 rows, scrollable beyond ]                │
+│   Scenario: [1][2][3][4][5][6]  HTTP POST · ephemeral · …    │
+│   Transport: [HTTP POST] [WebSocket]                         │
+│   Session: [Ephemeral] [Persistent]  (o) Persist history     │
+│                                      [New chat] [Submit]     │
+│   (Tab key shows sample query picker)                        │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 Each stage accordion item expands to show event cards. Each event card is a `<details open>` element showing:
